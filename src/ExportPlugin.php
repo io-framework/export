@@ -1,0 +1,98 @@
+<?php
+
+namespace Io\Export;
+
+use Io\Container;
+use Io\Export\Writers\{CsvWriter, HtmlWriter, JsonLinesWriter, OdsWriter, XlsxWriter, XmlWriter};
+use Io\Html;
+use Io\Http\{Request, Response};
+use Io\Plugin\{OpenApiExtension, PluginBase, Renderer, ViewHelper};
+
+/**
+ * Register with `$app->plugin(new ExportPlugin())`. A Sheet returned from a
+ * route becomes a download in the format its extension names (csv, jsonl,
+ * html, xml, xlsx, ods built in; more through Writers::add() from another
+ * plugin), the spec lists every installed content type, and templates get
+ * `$this->sheet($sheet)` for an inline HTML table.
+ */
+final class ExportPlugin extends PluginBase implements Renderer, OpenApiExtension, ViewHelper
+{
+    private Writers $writers;
+    private HtmlWriter $html;
+
+    public function name(): string
+    {
+        return 'export';
+    }
+
+    /** Creates Cells and the built-in writers from $options and puts Cells and Writers into the container. */
+    public function boot(Container $container, ExportOptions $options): void
+    {
+        $cells = new Cells($options);
+        $this->html = new HtmlWriter($cells);
+        $this->writers = (new Writers())
+            ->add(new CsvWriter($cells, $options))
+            ->add(new JsonLinesWriter($cells))
+            ->add($this->html)
+            ->add(new XmlWriter($cells, $options))
+            ->add(new XlsxWriter($cells, $options))
+            ->add(new OdsWriter($cells));
+        $container->set($cells);
+        $container->set($this->writers);
+    }
+
+    public function hooks(): array
+    {
+        return [$this];
+    }
+
+    /** True for a Sheet. */
+    public function supports(mixed $result): bool
+    {
+        return $result instanceof Sheet;
+    }
+
+    /**
+     * Writes the sheet with the writer for its format, as an attachment with `Cache-Control: no-store`.
+     *
+     * @throws \RuntimeException when no writer is installed for the sheet's format
+     */
+    public function render(mixed $result, Request $req, Response $res): void
+    {
+        if (!$result instanceof Sheet) {
+            return;
+        }
+        $writer = $this->writers->for($result->getFormat());
+        $res->withHeader('Content-Type', $writer->contentType())
+            ->withHeader('Content-Disposition', 'attachment; filename="' . $result->getFilename() . '"; filename*=UTF-8\'\'' . rawurlencode($result->getFilename()))
+            ->withHeader('Cache-Control', 'no-store');
+        foreach ($writer->stream($result) as $chunk) {
+            $res->write($chunk);
+        }
+    }
+
+    /** `sheet`: `$this->sheet($sheet)` in a view returns the sheet as a bare HTML `<table>`, as Html. */
+    public function helpers(): array
+    {
+        return ['sheet' => fn (Sheet $sheet): Html => new Html(implode('', iterator_to_array($this->html->fragment($sheet), false)))];
+    }
+
+    public function describeParameter(array $parameter): ?array
+    {
+        return null;
+    }
+
+    /** For a Sheet return type: one content entry per installed writer's media type. */
+    public function describeResult(string $returnType): ?array
+    {
+        if ($returnType !== Sheet::class) {
+            return null;
+        }
+        $content = [];
+        foreach ($this->writers->all() as $extension => $writer) {
+            $type = trim(explode(';', $writer->contentType())[0]);
+            $content[$type] = ['schema' => ['type' => 'string', 'description' => "File download (.$extension, Content-Disposition: attachment)"]];
+        }
+        return $content;
+    }
+}
